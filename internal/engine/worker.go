@@ -24,12 +24,9 @@ func New(st *persist.Store) *Worker {
 }
 func (w *Worker) Recover() error {
 	return w.store.Update(func(s *model.State) error {
-		for id, j := range s.Jobs {
-			if j.State == "running" {
-				j.State = "queued"
-				j.UpdatedAt = time.Now().UTC()
-				s.Jobs[id] = j
-				s.Emit("job.recovered", id)
+		for id := range s.Jobs {
+			if _, _, e := s.CommitJob(model.JobFact{Transition: model.RecoverJob, JobID: id}); e != nil {
+				return e
 			}
 		}
 		return nil
@@ -62,7 +59,7 @@ func (w *Worker) claim() (model.Job, bool, error) {
 	state := w.store.Read()
 	ids := []string{}
 	for id, j := range state.Jobs {
-		if j.State == "queued" {
+		if j.State == model.JobQueued {
 			ids = append(ids, id)
 		}
 	}
@@ -77,16 +74,14 @@ func (w *Worker) claim() (model.Job, bool, error) {
 		return a.CreatedAt.Before(b.CreatedAt)
 	})
 	e := w.store.Update(func(s *model.State) error {
-		j := s.Jobs[ids[0]]
-		if j.State != "queued" {
-			return nil
+		j, committed, e := s.CommitJob(model.JobFact{Transition: model.ClaimJob, JobID: ids[0]})
+		if e != nil {
+			return e
 		}
-		j.State = "running"
-		j.UpdatedAt = time.Now().UTC()
-		s.Jobs[j.ID] = j
-		s.Emit("job.running", j.ID)
-		job = j
-		found = true
+		if committed {
+			job = j
+			found = true
+		}
 		return nil
 	})
 	return job, found, e
@@ -104,7 +99,7 @@ func (w *Worker) step(parent context.Context) error {
 	defer func() { w.mu.Lock(); delete(w.active, j.ID); w.mu.Unlock() }()
 	// Cancellation can commit between claim and tracking; consult the committed state.
 	current := w.store.Read().Jobs[j.ID]
-	if current.State != "running" {
+	if current.State != model.JobRunning {
 		cancel()
 	}
 	plan, e := raster.Compile(j.Payload, j.Scale)
@@ -121,28 +116,20 @@ func (w *Worker) step(parent context.Context) error {
 		return nil
 	}
 	return w.store.Update(func(s *model.State) error {
-		v := s.Jobs[j.ID]
-		if v.State != "running" || v.Attempt != j.Attempt {
-			return nil
+		// The completion fact is fenced to the claimed attempt: a cancel or
+		// retry committed meanwhile wins and this fact is dropped.
+		fact := model.JobFact{JobID: j.ID, Attempt: j.Attempt}
+		switch {
+		case e == nil:
+			fact.Transition = model.SucceedJob
+			fact.Artifact = &model.Artifact{State: "live", Digest: model.Digest(data), Width: plan.Width, Height: plan.Height, PNG: data}
+		case errors.Is(e, context.Canceled):
+			fact.Transition = model.AbortJob
+		default:
+			fact.Transition = model.FailJob
+			fact.Error = e.Error()
 		}
-		v.UpdatedAt = time.Now().UTC()
-		if e != nil {
-			if errors.Is(e, context.Canceled) {
-				v.State = "cancelled"
-			} else {
-				v.State = "failed"
-				v.Error = e.Error()
-			}
-			s.Jobs[v.ID] = v
-			s.Emit("job."+v.State, v.ID)
-			return nil
-		}
-		a := model.Artifact{ID: model.ID("png", s.Sequence+1), JobID: v.ID, State: "live", Digest: model.Digest(data), Width: plan.Width, Height: plan.Height, PNG: data}
-		s.Artifacts[a.ID] = a
-		v.State = "succeeded"
-		v.ArtifactID = a.ID
-		s.Jobs[v.ID] = v
-		s.Emit("job.succeeded", v.ID)
-		return nil
+		_, _, cerr := s.CommitJob(fact)
+		return cerr
 	})
 }

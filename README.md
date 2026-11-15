@@ -21,6 +21,7 @@ python3 scripts/walkthrough.py --workflow retire-asset
 python3 scripts/walkthrough.py --workflow cancel-render
 python3 scripts/walkthrough.py --workflow retry-render
 python3 scripts/walkthrough.py --workflow recover-render
+python3 scripts/walkthrough.py --workflow job-protocol
 python3 scripts/walkthrough.py --workflow import-package
 python3 scripts/walkthrough.py --workflow compare-renders
 ```

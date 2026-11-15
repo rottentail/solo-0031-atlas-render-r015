@@ -5,7 +5,6 @@ import (
 	"atlas-render/internal/raster"
 	"atlas-render/internal/scene"
 	"fmt"
-	"time"
 )
 
 func (s *Service) Submit(snapshotID string, scale int, key string) (model.Job, error) {
@@ -32,20 +31,20 @@ func (s *Service) Submit(snapshotID string, scale int, key string) (model.Job, e
 		if _, e := raster.Compile(snap, scale); e != nil {
 			return e
 		}
-		pending := 0
-		for _, j := range st.Jobs {
-			if j.State == "queued" || j.State == "running" {
-				pending++
-			}
-		}
-		if pending >= 64 {
+		if pendingJobs(*st, "") >= 64 {
 			return model.Busy("render queue is full")
 		}
-		now := time.Now().UTC()
-		out = model.Job{ID: model.ID("job", st.Sequence+1), SnapshotID: snapshotID, State: "queued", Scale: scale, Attempt: 1, CreatedAt: now, UpdatedAt: now, Payload: snap}
-		st.Jobs[out.ID] = out
-		st.Receipts[key] = model.Receipt{Key: key, Fingerprint: fingerprint, JobID: out.ID}
-		st.Emit("job.queued", out.ID)
+		j, _, e := st.CommitJob(model.JobFact{Transition: model.SubmitJob, Draft: &model.Job{
+			ID:         model.ID("job", st.Sequence+1),
+			SnapshotID: snapshotID,
+			Scale:      scale,
+			Payload:    snap,
+		}})
+		if e != nil {
+			return e
+		}
+		st.Receipts[key] = model.Receipt{Key: key, Fingerprint: fingerprint, JobID: j.ID}
+		out = j
 		return nil
 	})
 	return out, e
@@ -53,51 +52,24 @@ func (s *Service) Submit(snapshotID string, scale int, key string) (model.Job, e
 func (s *Service) Cancel(id string) (model.Job, error) {
 	var out model.Job
 	e := s.Store.Update(func(st *model.State) error {
-		j, ok := st.Jobs[id]
-		if !ok {
-			return model.Missing("job not found")
-		}
-		if j.State == "cancelled" {
-			out = j
-			return nil
-		}
-		if j.State != "queued" && j.State != "running" {
-			return model.Conflict("job has already finished")
-		}
-		j.State = "cancelled"
-		j.UpdatedAt = time.Now().UTC()
-		st.Jobs[id] = j
-		st.Emit("job.cancelled", id)
+		j, _, e := st.CommitJob(model.JobFact{Transition: model.CancelJob, JobID: id})
 		out = j
-		return nil
+		return e
 	})
 	return out, e
 }
 func (s *Service) Retry(id string) (model.Job, error) {
 	var out model.Job
 	e := s.Store.Update(func(st *model.State) error {
-		j, ok := st.Jobs[id]
-		if !ok {
-			return model.Missing("job not found")
+		j, _, e := st.CommitJob(model.JobFact{Transition: model.RetryJob, JobID: id})
+		if e != nil {
+			return e
 		}
-		if j.State != "failed" && j.State != "cancelled" {
-			return model.Conflict("only failed or cancelled jobs can retry")
-		}
-		n := 0
-		for _, v := range st.Jobs {
-			if v.State == "queued" || v.State == "running" {
-				n++
-			}
-		}
-		if n >= 64 {
+		// Capacity is charged against other pending jobs; the retried job
+		// already reads as queued inside this transaction, so exclude it.
+		if pendingJobs(*st, id) >= 64 {
 			return model.Busy("render queue is full")
 		}
-		j.State = "queued"
-		j.Error = ""
-		j.Attempt++
-		j.UpdatedAt = time.Now().UTC()
-		st.Jobs[id] = j
-		st.Emit("job.retried", id)
 		out = j
 		return nil
 	})
@@ -128,4 +100,15 @@ func (s *Service) Artifact(id string) (model.Artifact, error) {
 		return a, model.Gone(fmt.Sprintf("artifact %s was purged", id))
 	}
 	return a, nil
+}
+
+// pendingJobs counts the jobs holding queue capacity, excluding exclude.
+func pendingJobs(st model.State, exclude string) int {
+	n := 0
+	for id, j := range st.Jobs {
+		if id != exclude && (j.State == model.JobQueued || j.State == model.JobRunning) {
+			n++
+		}
+	}
+	return n
 }

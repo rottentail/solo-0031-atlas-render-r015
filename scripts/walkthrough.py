@@ -39,6 +39,27 @@ def tiny_png():
     return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 2, 2, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(b'\0' + bytes([240, 40, 80, 255] * 2) + b'\0' + bytes([40, 80, 240, 128] * 2))) + chunk(b'IEND', b'')
 
 
+def heavy_document():
+    doc = sample()
+    doc['width'] = 1500
+    doc['height'] = 1500
+    doc['layers'] = [dict(doc['layers'][0], id=f'sheet-{i}', width=1500, height=1500, transform={'scaleX': 1, 'scaleY': 1}) for i in range(16)]
+    return doc
+
+
+# 任务生命周期协议的外部镜像：事件种类 → (允许的前置状态, 提交后状态)。
+# 与 internal/model/jobs.go 中的协议表一一对应；重放事件流必须落回已提交状态。
+JOB_PROTOCOL = {
+    'job.queued': (frozenset([None]), 'queued'),
+    'job.running': (frozenset(['queued']), 'running'),
+    'job.cancelled': (frozenset(['queued', 'running']), 'cancelled'),
+    'job.retried': (frozenset(['failed', 'cancelled']), 'queued'),
+    'job.recovered': (frozenset(['running']), 'queued'),
+    'job.succeeded': (frozenset(['running']), 'succeeded'),
+    'job.failed': (frozenset(['running']), 'failed'),
+}
+
+
 class Demo:
     def __init__(self, binary, directory):
         self.binary = binary
@@ -102,7 +123,111 @@ class Demo:
         return self.call('POST', '/v1/jobs', {'snapshotId': snapshot['id'], 'scale': scale}, 202, {'Idempotency-Key': key})
 
 
+def job_protocol(demo):
+    doc = sample()
+    demo.call('PUT', '/v1/scenes/emblem', {'name': '协议场景', 'expectedRevision': 0, 'document': doc})
+    small = demo.call('POST', '/v1/scenes/emblem/snapshots', {'expectedRevision': 1}, 201)
+    demo.call('PUT', '/v1/scenes/emblem', {'name': '协议场景', 'expectedRevision': 1, 'document': heavy_document()})
+    big = demo.call('POST', '/v1/scenes/emblem/snapshots', {'expectedRevision': 2}, 201)
+
+    # 队列容量：两个重任务占住执行器期间，提交与重试共享同一容量规则。
+    blockers = [demo.submit(big, f'proto-block-{i}') for i in range(2)]
+    fills = [demo.submit(small, f'proto-fill-{i}') for i in range(62)]
+    demo.call('POST', '/v1/jobs', {'snapshotId': small['id'], 'scale': 1}, 429, {'Idempotency-Key': 'proto-overflow'})
+    evicted = fills[0]['id']
+    demo.call('POST', f'/v1/jobs/{evicted}/cancel')
+    fills.append(demo.submit(small, 'proto-fill-62'))
+    demo.call('POST', f'/v1/jobs/{evicted}/retry', status=429)
+    for f in fills[1:]:
+        demo.call('POST', f"/v1/jobs/{f['id']}/cancel")
+    for b in blockers:
+        assert demo.wait(b['id'])['state'] == 'succeeded'
+    for f in fills:
+        j = demo.call('GET', f"/v1/jobs/{f['id']}")
+        assert j['state'] == 'cancelled' and not j.get('artifactId'), j
+
+    # 排队中取消是唯一已提交事实；重复取消幂等，执行器稍候也不会再领取它。
+    busy = demo.submit(big, 'proto-busy')
+    demo.wait(busy['id'], wanted=('running',))
+    queued = demo.submit(small, 'proto-queued')
+    first = demo.call('POST', f"/v1/jobs/{queued['id']}/cancel")
+    again = demo.call('POST', f"/v1/jobs/{queued['id']}/cancel")
+    assert first['state'] == again['state'] == 'cancelled'
+    demo.wait(busy['id'])
+    time.sleep(.2)
+    q = demo.call('GET', f"/v1/jobs/{queued['id']}")
+    assert q['state'] == 'cancelled' and not q.get('artifactId'), q
+
+    # 运行中取消与立即重试真实交错：旧尝试的完成事实被围栏丢弃，
+    # 取消与成功各自只提交一次，终态后取消和重试都被拒绝。
+    racer = demo.submit(big, 'proto-racer')
+    demo.wait(racer['id'], wanted=('running',))
+    stopped = demo.call('POST', f"/v1/jobs/{racer['id']}/cancel")
+    assert stopped['state'] == 'cancelled'
+    retried = demo.call('POST', f"/v1/jobs/{racer['id']}/retry", status=202)
+    assert retried['attempt'] == 2 and retried['state'] == 'queued'
+    result = demo.wait(racer['id'])
+    assert result['attempt'] == 2 and result['artifactId']
+    demo.call('POST', f"/v1/jobs/{racer['id']}/cancel", status=409)
+    demo.call('POST', f"/v1/jobs/{racer['id']}/retry", status=409)
+    assert demo.call('GET', f"/v1/jobs/{racer['id']}")['state'] == 'succeeded'
+
+    # 同键重放穿过取消、重试和成功仍返回原任务；改换语义返回409。
+    assert demo.submit(big, 'proto-racer')['id'] == racer['id']
+    demo.call('POST', '/v1/jobs', {'snapshotId': big['id'], 'scale': 2}, 409, {'Idempotency-Key': 'proto-racer'})
+
+    # 清理结果字节保留成功事实。
+    demo.call('DELETE', f"/v1/artifacts/{result['artifactId']}")
+    demo.call('GET', f"/v1/artifacts/{result['artifactId']}", status=410)
+    kept = demo.call('GET', f"/v1/jobs/{racer['id']}")
+    assert kept['state'] == 'succeeded' and kept['artifactId'] == result['artifactId']
+
+    # SIGKILL 重启：运行中任务重新入队，attempt 不变，最终由同一固定输入完成。
+    victim = demo.submit(big, 'proto-victim')
+    demo.wait(victim['id'], wanted=('running',))
+    demo.stop(abrupt=True)
+    demo.start()
+    recovered = demo.wait(victim['id'])
+    assert recovered['attempt'] == 1 and recovered['state'] == 'succeeded'
+    png = demo.call('GET', f"/v1/artifacts/{recovered['artifactId']}")
+    assert png[:8] == b'\x89PNG\r\n\x1a\n'
+
+    # 重启后：旧幂等键仍重放原任务，成功任务不可取消，排队取消仍生效。
+    assert demo.submit(big, 'proto-victim')['id'] == victim['id']
+    demo.call('POST', f"/v1/jobs/{victim['id']}/cancel", status=409)
+    busy2 = demo.submit(big, 'proto-busy-2')
+    demo.wait(busy2['id'], wanted=('running',))
+    queued2 = demo.submit(small, 'proto-queued-2')
+    assert demo.call('POST', f"/v1/jobs/{queued2['id']}/cancel")['state'] == 'cancelled'
+    demo.wait(busy2['id'])
+
+    # 审计：每个任务的事件流按协议表重放，必须落回 GET 返回的已提交状态。
+    events = demo.call('GET', '/v1/events')
+    by_job = {}
+    for e in events:
+        if e['kind'].startswith('job.'):
+            by_job.setdefault(e['subject'], []).append(e['kind'])
+    for job_id, stream in by_job.items():
+        state = None
+        for kind in stream:
+            allowed, target = JOB_PROTOCOL[kind]
+            assert state in allowed, f'{job_id}: {kind} committed from {state}'
+            state = target
+        committed = demo.call('GET', f'/v1/jobs/{job_id}')['state']
+        assert committed == state, f'{job_id}: replay reached {state}, committed is {committed}'
+    racer_stream = by_job[racer['id']]
+    assert racer_stream.count('job.cancelled') == 1 and racer_stream.count('job.succeeded') == 1
+    assert racer_stream.index('job.cancelled') < racer_stream.index('job.retried') < racer_stream.index('job.succeeded')
+    assert by_job[queued['id']] == ['job.queued', 'job.cancelled']
+    assert by_job[victim['id']].count('job.recovered') == 1
+    return {'workflow': 'job-protocol', 'jobsAudited': len(by_job),
+            'cancelledFills': len(fills), 'racerAttempt': result['attempt'],
+            'recoveredAttempt': recovered['attempt'], 'recoveredPngBytes': len(png)}
+
+
 def run(demo, workflow, out):
+    if workflow == 'job-protocol':
+        return job_protocol(demo)
     d = sample()
     put = lambda doc, rev=0: demo.call('PUT', '/v1/scenes/emblem', {'name': '双色印记', 'expectedRevision': rev, 'document': doc})
     scene = put(d)
@@ -141,9 +266,7 @@ def run(demo, workflow, out):
         demo.call('POST', '/v1/imports/corrupt', {'name': '损坏包', 'package': corrupt}, 400)
         demo.call('GET', '/v1/scenes/corrupt', status=404)
     if workflow in ('cancel-render', 'retry-render', 'recover-render'):
-        heavy = sample(); heavy['width'] = 1500; heavy['height'] = 1500
-        heavy['layers'] = [dict(heavy['layers'][0], id=f'sheet-{i}', width=1500, height=1500, transform={'scaleX': 1, 'scaleY': 1}) for i in range(16)]
-        put(heavy, current['revision'])
+        put(heavy_document(), current['revision'])
         snapshot = demo.call('POST', '/v1/scenes/emblem/snapshots', {'expectedRevision': current['revision'] + 1}, 201)
     job = demo.submit(snapshot)
     if workflow == 'submit-render':

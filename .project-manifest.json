@@ -264,6 +264,25 @@
       "verification": "python3 scripts/walkthrough.py --workflow recover-render"
     },
     {
+      "id": "job-protocol",
+      "name": "任务状态转换协议交错",
+      "entry": "POST /v1/jobs 与取消、重试、进程重启交错",
+      "success": "取消与成功各为唯一已提交事实，旧尝试不能覆盖新尝试，事件流可重放到已提交状态",
+      "failure": "终态后取消或重试返回409，队列满时提交或重试返回429",
+      "module_ids": [
+        "httpapi",
+        "service",
+        "engine",
+        "model",
+        "persist"
+      ],
+      "steps": [
+        "经公开HTTP入口完成领域转换",
+        "通过存储或渲染结果观察已提交事实"
+      ],
+      "verification": "python3 scripts/walkthrough.py --workflow job-protocol"
+    },
+    {
       "id": "export-package",
       "name": "导出快照交换包",
       "entry": "GET /v1/snapshots/{id}/package",

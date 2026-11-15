@@ -49,11 +49,11 @@ func Validate(s model.State) error {
 			return fmt.Errorf("orphan job %s", id)
 		}
 		switch j.State {
-		case "queued", "running", "failed", "cancelled":
+		case model.JobQueued, model.JobRunning, model.JobFailed, model.JobCancelled:
 			if j.ArtifactID != "" {
 				return fmt.Errorf("unfinished job references artifact")
 			}
-		case "succeeded":
+		case model.JobSucceeded:
 			a, ok := s.Artifacts[j.ArtifactID]
 			if !ok || a.JobID != id {
 				return fmt.Errorf("job result missing")
@@ -67,7 +67,7 @@ func Validate(s model.State) error {
 	}
 	for id, a := range s.Artifacts {
 		j, ok := s.Jobs[a.JobID]
-		if id != a.ID || !ok || j.ArtifactID != id || j.State != "succeeded" {
+		if id != a.ID || !ok || j.ArtifactID != id || j.State != model.JobSucceeded {
 			return fmt.Errorf("orphan artifact %s", id)
 		}
 		switch a.State {
